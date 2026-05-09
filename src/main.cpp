@@ -32,6 +32,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <io.h>      // _isatty
 #endif
 
 namespace {
@@ -149,7 +150,17 @@ int main(int argc, char** argv) {
     // If we were drag-dropped onto by Explorer the transient console will
     // close the moment we exit, hiding any error message. Hold the window
     // open so the user can read why we failed.
-    if (exit_code != 0 && we_own_console()) {
+    //
+    // Belt and suspenders: pause only when ALL conditions hold --
+    //   - we exited with an error (no need to bother on success)
+    //   - we own the console (drag-drop scenario, parent is Explorer)
+    //   - stdin is an interactive TTY (a human is actually there)
+    //
+    // The TTY check protects MCP servers, CI runners, and any
+    // programmatic invocation where stdin is piped or closed: those
+    // never trigger the prompt even in the rare case where someone
+    // spawns us with CREATE_NEW_CONSOLE.
+    if (exit_code != 0 && we_own_console() && _isatty(_fileno(stdin))) {
         std::fputs("\nPress ENTER to close...", stderr);
         std::fflush(stderr);
         std::getchar();
