@@ -477,6 +477,17 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 
 # =============================================================================
+# Windows: disable MSVC auto-manifest (we embed our own via app.rc)
+# =============================================================================
+# resources/app.rc.in carries an RT_MANIFEST resource that sets the process
+# active code page to UTF-8 (Windows 10 1903+). Without /MANIFEST:NO the
+# linker also generates a default manifest at the same resource ID, causing
+# CVT1100 duplicate resource errors.
+if(WIN32 AND MSVC)
+    target_link_options(${EXE_NAME} PRIVATE "/MANIFEST:NO")
+endif()
+
+# =============================================================================
 # Strip binary for release (Linux/macOS/Android)
 # =============================================================================
 if(NOT WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Release")
