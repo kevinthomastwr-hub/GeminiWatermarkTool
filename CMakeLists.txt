@@ -296,6 +296,7 @@ set(CORE_SOURCES
     src/core/watermark_engine.cpp
     src/core/blend_modes.cpp
     src/core/watermark_detector.cpp
+    src/utils/image_io.cpp
 )
 
 set(CORE_HEADERS
@@ -303,6 +304,7 @@ set(CORE_HEADERS
     src/core/blend_modes.hpp
     src/core/watermark_detector.hpp
     src/core/types.hpp
+    src/utils/image_io.hpp
 )
 
 # AI Denoise sources (conditional on ENABLE_AI_DENOISE)

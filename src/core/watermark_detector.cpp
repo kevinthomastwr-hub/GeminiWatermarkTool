@@ -34,8 +34,10 @@ std::unique_ptr<WatermarkEngine> g_detection_engine;
 WatermarkEngine& get_detection_engine() {
     if (!g_detection_engine) {
         g_detection_engine = std::make_unique<WatermarkEngine>(
-            embedded::bg_48_png, embedded::bg_48_png_size,
-            embedded::bg_96_png, embedded::bg_96_png_size
+            embedded::bg_48_png,   embedded::bg_48_png_size,
+            embedded::bg_96_png,   embedded::bg_96_png_size,
+            embedded::bg_b_36_png, embedded::bg_b_36_png_size,
+            embedded::bg_b_96_png, embedded::bg_b_96_png_size
         );
     }
     return *g_detection_engine;

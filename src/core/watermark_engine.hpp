@@ -12,8 +12,21 @@ namespace gwt {
  * Watermark size mode based on image dimensions
  */
 enum class WatermarkSize {
-    Small,   // 48x48, for images <= 1024x1024
-    Large,   // 96x96, for images > 1024x1024
+    Small,   // small canonical size
+    Large,   // large canonical size
+};
+
+/**
+ * Watermark variant.
+ *
+ * Two co-existing watermark profiles are recognised. V1 covers outputs
+ * from Gemini versions before 3.5; V2 covers outputs from 3.5 onward.
+ * Detection runs against the active variant only; the variant is chosen
+ * explicitly via the CLI --legacy flag or the GUI Legacy checkbox.
+ */
+enum class WatermarkVariant {
+    V1,   // legacy profile
+    V2,   // current profile
 };
 
 /**
@@ -24,10 +37,11 @@ struct DetectionResult {
     float confidence;        // Detection confidence (0.0 - 1.0)
     cv::Rect region;         // Detected watermark region
     WatermarkSize size;      // Detected watermark size
-    
+    WatermarkVariant variant{WatermarkVariant::V2};  // Which profile matched
+
     // Debug info
     float spatial_score;     // Stage 1: Spatial NCC score
-    float gradient_score;    // Stage 2: Gradient NCC score  
+    float gradient_score;    // Stage 2: Gradient NCC score
     float variance_score;    // Stage 3: Variance analysis score
 };
 
@@ -65,13 +79,19 @@ struct WatermarkPosition {
 };
 
 /**
- * Get the appropriate watermark configuration based on image size
+ * Get the watermark configuration for a given image size and variant.
  *
- * Rules discovered from Gemini:
- *   - W >= 1024 AND H >= 1024: 96x96 logo at (W-64-96, H-64-96)
- *   - Otherwise:               48x48 logo at (W-32-48, H-32-48)
+ * Each variant has its own logo size and margin from the bottom-right
+ * corner. The two-argument overload defaults to V2 (current profile);
+ * callers that need the legacy profile must request it explicitly.
  */
-WatermarkPosition get_watermark_config(int image_width, int image_height);
+WatermarkPosition get_watermark_config(int image_width, int image_height,
+                                       WatermarkVariant variant);
+
+/// Convenience overload: defaults to V2 (current profile).
+inline WatermarkPosition get_watermark_config(int image_width, int image_height) {
+    return get_watermark_config(image_width, image_height, WatermarkVariant::V2);
+}
 
 /**
  * Determine watermark size mode from image dimensions
@@ -121,11 +141,27 @@ public:
     /**
      * Initialize the engine with embedded PNG data (standalone mode)
      *
-     * @param png_data_small  Pointer to 48x48 PNG data
-     * @param png_size_small  Size of 48x48 PNG data
-     * @param png_data_large  Pointer to 96x96 PNG data
-     * @param png_size_large  Size of 96x96 PNG data
-     * @param logo_value      The logo brightness (default: 255.0 = white)
+     * V1 (legacy) and V2 (current) profile assets are both loaded; the
+     * detector picks the best-matching one per image at runtime.
+     *
+     * @param v1_small, v1_small_size  V1 small BG capture PNG bytes
+     * @param v1_large, v1_large_size  V1 large BG capture PNG bytes
+     * @param v2_small, v2_small_size  V2 small BG capture PNG bytes
+     * @param v2_large, v2_large_size  V2 large BG capture PNG bytes
+     * @param logo_value  The logo brightness (default: 255.0 = white)
+     */
+    WatermarkEngine(
+        const unsigned char* v1_small, size_t v1_small_size,
+        const unsigned char* v1_large, size_t v1_large_size,
+        const unsigned char* v2_small, size_t v2_small_size,
+        const unsigned char* v2_large, size_t v2_large_size,
+        float logo_value = 255.0f
+    );
+
+    /**
+     * Two-pair convenience constructor (V1-only). Retained for callers
+     * that have not been updated to supply V2 assets; V2 detection will
+     * be a no-op for engines built this way.
      */
     WatermarkEngine(
         const unsigned char* png_data_small, size_t png_size_small,
@@ -141,13 +177,17 @@ public:
      *   Stage 2: Gradient NCC - Edge signature correlation
      *   Stage 3: Variance Analysis - Texture dampening detection
      *
-     * @param image      The image to analyze
-     * @param force_size Force a specific watermark size (auto-detect if nullopt)
-     * @return           Detection result with confidence and region
+     * @param image          The image to analyze
+     * @param force_size     Force a specific watermark size (auto-detect if nullopt)
+     * @param force_variant  Force a specific variant (try both if nullopt).
+     *                       When both variants are tried, the higher-confidence
+     *                       match wins and is reflected in the returned variant.
+     * @return               Detection result with confidence, region, and variant
      */
     DetectionResult detect_watermark(
         const cv::Mat& image,
-        std::optional<WatermarkSize> force_size = std::nullopt
+        std::optional<WatermarkSize> force_size = std::nullopt,
+        std::optional<WatermarkVariant> force_variant = std::nullopt
     ) const;
 
     /**
@@ -178,23 +218,28 @@ public:
     /**
      * Remove watermark from an image
      *
-     * @param image     The image to process (will be modified in-place)
-     * @param force_size Force a specific watermark size (auto-detect if nullopt)
+     * @param image          The image to process (will be modified in-place)
+     * @param force_size     Force a specific watermark size (auto-detect if nullopt)
+     * @param force_variant  Force a specific profile (auto-detect if nullopt)
      */
     void remove_watermark(
         cv::Mat& image,
-        std::optional<WatermarkSize> force_size = std::nullopt
+        std::optional<WatermarkSize> force_size = std::nullopt,
+        std::optional<WatermarkVariant> force_variant = std::nullopt
     );
 
     /**
      * Remove watermark from a custom region with interpolated alpha map
      *
-     * @param image     The image to process (will be modified in-place)
-     * @param region    Custom watermark region (position + size)
+     * @param image          The image to process (will be modified in-place)
+     * @param region         Custom watermark region (position + size)
+     * @param force_variant  Profile to source the alpha map from
+     *                       (V2 default; pass V1 for legacy outputs)
      */
     void remove_watermark_custom(
         cv::Mat& image,
-        const cv::Rect& region
+        const cv::Rect& region,
+        std::optional<WatermarkVariant> force_variant = std::nullopt
     );
 
     /**
@@ -252,25 +297,38 @@ public:
         int padding = 32
     ) const;
 
+    /// Get a reference to the alpha map for a given size + variant.
+    const cv::Mat& get_alpha_map(WatermarkSize size, WatermarkVariant variant) const;
+
 private:
-    cv::Mat alpha_map_small_;   // 48x48 alpha map (CV_32FC1, 0.0-1.0)
-    cv::Mat alpha_map_large_;   // 96x96 alpha map (CV_32FC1, 0.0-1.0)
-    float logo_value_;          // Logo brightness (255 = white)
+    // Per-variant alpha maps (CV_32FC1, 0.0 - 1.0).
+    cv::Mat alpha_map_small_;       // V1 small (legacy alias used by older paths)
+    cv::Mat alpha_map_large_;       // V1 large (legacy alias used by older paths)
+    cv::Mat alpha_map_small_v2_;    // V2 small
+    cv::Mat alpha_map_large_v2_;    // V2 large
+    bool has_v2_{false};            // Whether V2 assets were loaded
+    float logo_value_;              // Logo brightness (255 = white)
 
     cv::Mat& get_alpha_map_mutable(WatermarkSize size);
-    
+
     /**
      * Create an interpolated alpha map for a custom size
      * Uses bilinear interpolation from the 96x96 alpha map
-     *
-     * @param target_width   Target width
-     * @param target_height  Target height
-     * @return               Interpolated alpha map (CV_32FC1)
      */
-    cv::Mat create_interpolated_alpha(int target_width, int target_height);
+    cv::Mat create_interpolated_alpha(int target_width, int target_height,
+                                       WatermarkVariant variant);
 
-    // Helper to initialize alpha maps from cv::Mat
+    // Helpers to initialise alpha maps from cv::Mat captures.
     void init_alpha_maps(const cv::Mat& bg_small, const cv::Mat& bg_large);
+    void init_alpha_maps_v2(const cv::Mat& bg_small, const cv::Mat& bg_large);
+
+    // Run the three-stage detection at a single variant. Used internally
+    // by detect_watermark() to try both variants and pick the higher.
+    DetectionResult detect_one_variant(
+        const cv::Mat& image,
+        std::optional<WatermarkSize> force_size,
+        WatermarkVariant variant
+    ) const;
 };
 
 /**
@@ -302,7 +360,8 @@ ProcessResult process_image(
     WatermarkEngine& engine,
     std::optional<WatermarkSize> force_size = std::nullopt,
     bool use_detection = false,
-    float detection_threshold = 0.25f
+    float detection_threshold = 0.25f,
+    std::optional<WatermarkVariant> force_variant = std::nullopt
 );
 
 } // namespace gwt

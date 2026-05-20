@@ -13,6 +13,7 @@
 
 #include "core/watermark_engine.hpp"
 #include "core/blend_modes.hpp"
+#include "utils/image_io.hpp"
 #include "utils/path_formatter.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -26,24 +27,70 @@
 
 namespace gwt {
 
-WatermarkPosition get_watermark_config(int image_width, int image_height) {
-    // Gemini's rules:
-    // - Large (96x96, 64px margin): BOTH width AND height > 1024
-    // - Small (48x48, 32px margin): Otherwise (including 1024x1024)
+namespace {
 
-    if (image_width > 1024 && image_height > 1024) {
-        return WatermarkPosition{
-            .margin_right = 64,
-            .margin_bottom = 64,
-            .logo_size = 96
-        };
+// Resolve V2 small position by inferring the canonical large source the
+// image was downscaled from. Small Gemini outputs are 1024-class on the
+// long side and inherit per-axis rounding from the source aspect ratio,
+// so a single fixed margin does not fit every aspect.
+WatermarkPosition v2_small_config_from_dims(int W, int H) {
+    const int long_side  = std::max(W, H);
+    const int short_side = std::min(W, H);
+
+    // Map the short side back to the canonical large width. Thresholds bisect
+    // the observed canonical heights (540, 559, 572) for a 1024-class small.
+    double source_long_dim;
+    if (short_side >= 566) {
+        source_long_dim = 2752.0;
+    } else if (short_side >= 550) {
+        source_long_dim = 2816.0;
     } else {
+        source_long_dim = 2848.0;
+    }
+
+    const double scale = static_cast<double>(long_side) / source_long_dim;
+    const int margin = static_cast<int>(std::round(192.0 * scale));
+    // The alpha template stays at 36 (downscaled from the 96 large); the
+    // actual logo on disk is sometimes 35 vs 36 depending on rounding,
+    // but the alpha map matches up either way.
+    return WatermarkPosition{
+        .margin_right = margin,
+        .margin_bottom = margin,
+        .logo_size = 36
+    };
+}
+
+}  // namespace
+
+WatermarkPosition get_watermark_config(int image_width, int image_height,
+                                       WatermarkVariant variant) {
+    const bool is_large = (image_width > 1024 && image_height > 1024);
+    if (variant == WatermarkVariant::V1) {
+        // Legacy profile
+        if (is_large) {
+            return WatermarkPosition{
+                .margin_right = 64,
+                .margin_bottom = 64,
+                .logo_size = 96
+            };
+        }
         return WatermarkPosition{
             .margin_right = 32,
             .margin_bottom = 32,
             .logo_size = 48
         };
     }
+    // V2 (current profile). Large stays at 192 margin / 96 logo, which
+    // matches the canonical 2752/2816/2848-wide outputs exactly. Small
+    // outputs need aspect-aware scaling -- see v2_small_config_from_dims().
+    if (is_large) {
+        return WatermarkPosition{
+            .margin_right = 192,
+            .margin_bottom = 192,
+            .logo_size = 96
+        };
+    }
+    return v2_small_config_from_dims(image_width, image_height);
 }
 
 WatermarkSize get_watermark_size(int image_width, int image_height) {
@@ -53,6 +100,23 @@ WatermarkSize get_watermark_size(int image_width, int image_height) {
         return WatermarkSize::Large;
     }
     return WatermarkSize::Small;
+}
+
+void WatermarkEngine::init_alpha_maps_v2(const cv::Mat& bg_small, const cv::Mat& bg_large) {
+    cv::Mat small_resized = bg_small;
+    cv::Mat large_resized = bg_large;
+
+    // Resize if needed -- V2 canonical sizes are 36x36 (small) and 96x96 (large)
+    if (small_resized.cols != 36 || small_resized.rows != 36) {
+        cv::resize(small_resized, small_resized, cv::Size(36, 36), 0, 0, cv::INTER_AREA);
+    }
+    if (large_resized.cols != 96 || large_resized.rows != 96) {
+        cv::resize(large_resized, large_resized, cv::Size(96, 96), 0, 0, cv::INTER_AREA);
+    }
+
+    alpha_map_small_v2_ = calculate_alpha_map(small_resized);
+    alpha_map_large_v2_ = calculate_alpha_map(large_resized);
+    has_v2_ = true;
 }
 
 // Helper function to initialize alpha maps
@@ -109,6 +173,35 @@ WatermarkEngine::WatermarkEngine(
     spdlog::info("Loaded background captures from files");
 }
 
+// Six-argument constructor: V1 + V2 assets together.
+WatermarkEngine::WatermarkEngine(
+    const unsigned char* v1_small, size_t v1_small_size,
+    const unsigned char* v1_large, size_t v1_large_size,
+    const unsigned char* v2_small, size_t v2_small_size,
+    const unsigned char* v2_large, size_t v2_large_size,
+    float logo_value)
+    : logo_value_(logo_value) {
+
+    auto decode = [](const unsigned char* data, size_t size, const char* label) {
+        std::vector<unsigned char> buf(data, data + size);
+        cv::Mat img = cv::imdecode(buf, cv::IMREAD_COLOR);
+        if (img.empty()) {
+            throw std::runtime_error(std::string("Failed to decode embedded ") + label);
+        }
+        return img;
+    };
+
+    cv::Mat bg_v1_small = decode(v1_small, v1_small_size, "V1 small BG capture");
+    cv::Mat bg_v1_large = decode(v1_large, v1_large_size, "V1 large BG capture");
+    cv::Mat bg_v2_small = decode(v2_small, v2_small_size, "V2 small BG capture");
+    cv::Mat bg_v2_large = decode(v2_large, v2_large_size, "V2 large BG capture");
+
+    init_alpha_maps(bg_v1_small, bg_v1_large);
+    init_alpha_maps_v2(bg_v2_small, bg_v2_large);
+    spdlog::info("Loaded embedded BG captures (V1 + V2 profiles)");
+}
+
+// Four-argument constructor (legacy). Loads V1 only; V2 detection is disabled.
 WatermarkEngine::WatermarkEngine(
     const unsigned char* png_data_small, size_t png_size_small,
     const unsigned char* png_data_large, size_t png_size_large,
@@ -135,7 +228,8 @@ WatermarkEngine::WatermarkEngine(
 
 void WatermarkEngine::remove_watermark(
     cv::Mat& image,
-    std::optional<WatermarkSize> force_size) {
+    std::optional<WatermarkSize> force_size,
+    std::optional<WatermarkVariant> force_variant) {
     if (image.empty()) {
         throw std::runtime_error("Empty image provided");
     }
@@ -147,25 +241,29 @@ void WatermarkEngine::remove_watermark(
         cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
     }
 
+    // Default to V2 (current profile). Callers passing force_variant
+    // pin the choice. If the engine was built without V2 assets fall back
+    // to V1 unconditionally.
+    const WatermarkVariant variant = force_variant.value_or(
+        has_v2_ ? WatermarkVariant::V2 : WatermarkVariant::V1);
+
     // Determine watermark size
-    WatermarkSize size = force_size.value_or(
+    const WatermarkSize size = force_size.value_or(
         get_watermark_size(image.cols, image.rows)
     );
 
-    // Get position config based on actual size used
-    WatermarkPosition config;
-    if (size == WatermarkSize::Small) {
-        config = WatermarkPosition{32, 32, 48};
-    } else {
-        config = WatermarkPosition{64, 64, 96};
-    }
+    // Run detection so the V2 small snap refinement applies here too --
+    // formula position rounds inconsistently across source aspect ratios,
+    // and we want remove to operate on the same exact pixels the detector
+    // matched.
+    const DetectionResult det = detect_one_variant(image, size, variant);
+    const cv::Point pos(det.region.x, det.region.y);
+    const cv::Mat& alpha_map = get_alpha_map(size, variant);
 
-    cv::Point pos = config.get_position(image.cols, image.rows);
-    const cv::Mat& alpha_map = get_alpha_map(size);
-
-    spdlog::debug("Removing watermark at ({}, {}) with {}x{} alpha map (size: {})",
+    spdlog::debug("Removing watermark at ({}, {}) with {}x{} alpha map (size: {}, variant: {})",
                   pos.x, pos.y, alpha_map.cols, alpha_map.rows,
-                  size == WatermarkSize::Small ? "Small" : "Large");
+                  size == WatermarkSize::Small ? "Small" : "Large",
+                  variant == WatermarkVariant::V1 ? "V1" : "V2");
 
     // Apply reverse alpha blending
     remove_watermark_alpha_blend(image, alpha_map, pos, logo_value_);
@@ -218,13 +316,34 @@ const cv::Mat& WatermarkEngine::get_alpha_map(WatermarkSize size) const {
     return (size == WatermarkSize::Small) ? alpha_map_small_ : alpha_map_large_;
 }
 
+const cv::Mat& WatermarkEngine::get_alpha_map(WatermarkSize size,
+                                              WatermarkVariant variant) const {
+    if (variant == WatermarkVariant::V2 && has_v2_) {
+        return (size == WatermarkSize::Small) ? alpha_map_small_v2_ : alpha_map_large_v2_;
+    }
+    return (size == WatermarkSize::Small) ? alpha_map_small_ : alpha_map_large_;
+}
+
 // =============================================================================
 // Watermark Detection (Three-Stage Algorithm)
 // =============================================================================
 
 DetectionResult WatermarkEngine::detect_watermark(
     const cv::Mat& image,
-    std::optional<WatermarkSize> force_size) const
+    std::optional<WatermarkSize> force_size,
+    std::optional<WatermarkVariant> force_variant) const
+{
+    // Default to V2 (current profile). Callers that need V1 (legacy Gemini
+    // outputs) pass force_variant explicitly -- the CLI --legacy flag and
+    // the GUI Legacy checkbox both wire through here.
+    const WatermarkVariant variant = force_variant.value_or(WatermarkVariant::V2);
+    return detect_one_variant(image, force_size, variant);
+}
+
+DetectionResult WatermarkEngine::detect_one_variant(
+    const cv::Mat& image,
+    std::optional<WatermarkSize> force_size,
+    WatermarkVariant variant) const
 {
     DetectionResult result{};
     result.detected = false;
@@ -232,25 +351,33 @@ DetectionResult WatermarkEngine::detect_watermark(
     result.spatial_score = 0.0f;
     result.gradient_score = 0.0f;
     result.variance_score = 0.0f;
+    result.variant = variant;
 
     if (image.empty()) {
         return result;
     }
 
-    // Determine watermark size and position
+    // Determine watermark size and position for the requested variant
     const WatermarkSize size = force_size.value_or(get_watermark_size(image.cols, image.rows));
-    const WatermarkPosition config = get_watermark_config(image.cols, image.rows);
-    const cv::Point pos = config.get_position(image.cols, image.rows);
-    const cv::Mat& alpha_map = get_alpha_map(size);
+    const WatermarkPosition config = get_watermark_config(image.cols, image.rows, variant);
+    cv::Point pos = config.get_position(image.cols, image.rows);
+    const cv::Mat& alpha_map = get_alpha_map(size, variant);
+
+    // V2 small position is derived from the inferred canonical source
+    // dimensions and accurate to ~1-3 px in most cases. A narrow NCC sweep
+    // absorbs the residual rounding noise without giving content artefacts
+    // a chance to outscore the actual watermark on busy backgrounds.
+    const bool needs_snap = (variant == WatermarkVariant::V2 && size == WatermarkSize::Small);
+    const int snap_pad = needs_snap ? 3 : 0;
 
     result.size = size;
     result.region = cv::Rect(pos.x, pos.y, alpha_map.cols, alpha_map.rows);
 
-    // Calculate ROI (clamp to image bounds)
-    const int x1 = std::max(0, pos.x);
-    const int y1 = std::max(0, pos.y);
-    const int x2 = std::min(image.cols, pos.x + alpha_map.cols);
-    const int y2 = std::min(image.rows, pos.y + alpha_map.rows);
+    // Calculate ROI (clamp to image bounds), expanded by snap_pad for V2 small.
+    const int x1 = std::max(0, pos.x - snap_pad);
+    const int y1 = std::max(0, pos.y - snap_pad);
+    const int x2 = std::min(image.cols, pos.x + alpha_map.cols + snap_pad);
+    const int y2 = std::min(image.rows, pos.y + alpha_map.rows + snap_pad);
 
     if (x1 >= x2 || y1 >= y2) {
         spdlog::debug("Detection: ROI out of bounds");
@@ -272,9 +399,16 @@ DetectionResult WatermarkEngine::detect_watermark(
     cv::Mat gray_f;
     gray_region.convertTo(gray_f, CV_32F, 1.0 / 255.0);
 
-    // Get corresponding alpha region
-    const cv::Rect alpha_roi(x1 - pos.x, y1 - pos.y, x2 - x1, y2 - y1);
-    cv::Mat alpha_region = alpha_map(alpha_roi);
+    // For snap mode the alpha region is the full alpha map (NCC slides it
+    // across the wider gray region); for non-snap it's clamped to the
+    // image bounds in case the formula position pokes outside.
+    cv::Mat alpha_region;
+    if (needs_snap) {
+        alpha_region = alpha_map;
+    } else {
+        const cv::Rect alpha_roi(x1 - pos.x, y1 - pos.y, x2 - x1, y2 - y1);
+        alpha_region = alpha_map(alpha_roi);
+    }
 
     // =========================================================================
     // Stage 1: Spatial Structural Correlation (NCC)
@@ -284,8 +418,20 @@ DetectionResult WatermarkEngine::detect_watermark(
     cv::matchTemplate(gray_f, alpha_region, spatial_match, cv::TM_CCOEFF_NORMED);
 
     double min_spatial, spatial_score;
-    cv::minMaxLoc(spatial_match, &min_spatial, &spatial_score);
+    cv::Point match_loc;
+    cv::minMaxLoc(spatial_match, &min_spatial, &spatial_score, nullptr, &match_loc);
     result.spatial_score = static_cast<float>(spatial_score);
+
+    // If we snapped, the best NCC offset gives us the refined absolute
+    // position -- but only trust it when the correlation is strong enough.
+    // Busy backgrounds (low NCC) can pull the match a few pixels toward
+    // content artefacts; falling back to the geometry-derived formula
+    // position is more reliable there.
+    if (needs_snap && spatial_score >= 0.60) {
+        pos.x = x1 + match_loc.x;
+        pos.y = y1 + match_loc.y;
+        result.region = cv::Rect(pos.x, pos.y, alpha_map.cols, alpha_map.rows);
+    }
 
     // Circuit Breaker: If spatial correlation is too low, definitely no watermark
     constexpr double kSpatialThreshold = 0.25;
@@ -368,9 +514,11 @@ DetectionResult WatermarkEngine::detect_watermark(
     return result;
 }
 
-cv::Mat WatermarkEngine::create_interpolated_alpha(int target_width, int target_height) {
-    // Use 96x96 large alpha map as source (higher resolution = better quality)
-    const cv::Mat& source = alpha_map_large_;
+cv::Mat WatermarkEngine::create_interpolated_alpha(int target_width, int target_height,
+                                                    WatermarkVariant variant) {
+    // Use the 96x96 large alpha map of the active profile as source
+    // (higher resolution = better quality on resize).
+    const cv::Mat& source = get_alpha_map(WatermarkSize::Large, variant);
 
     if (target_width == source.cols && target_height == source.rows) {
         return source.clone();
@@ -394,7 +542,8 @@ cv::Mat WatermarkEngine::create_interpolated_alpha(int target_width, int target_
 
 void WatermarkEngine::remove_watermark_custom(
     cv::Mat& image,
-    const cv::Rect& region)
+    const cv::Rect& region,
+    std::optional<WatermarkVariant> force_variant)
 {
     if (image.empty()) {
         throw std::runtime_error("Empty image provided");
@@ -407,27 +556,39 @@ void WatermarkEngine::remove_watermark_custom(
         cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
     }
 
-    // Check for exact match with standard sizes
+    // Source the alpha map from the active profile (V2 by default).
+    const WatermarkVariant variant = force_variant.value_or(
+        has_v2_ ? WatermarkVariant::V2 : WatermarkVariant::V1);
+
+    const cv::Point pos(region.x, region.y);
+
+    // Fast paths when the user-selected region matches a canonical size.
+    if (region.width == 36 && region.height == 36) {
+        spdlog::info("Custom region matches 36x36, using current-profile small alpha");
+        remove_watermark_alpha_blend(image, get_alpha_map(WatermarkSize::Small, variant),
+                                     pos, logo_value_);
+        return;
+    }
     if (region.width == 48 && region.height == 48) {
-        spdlog::info("Custom region matches 48x48, using small alpha map");
-        cv::Point pos(region.x, region.y);
-        remove_watermark_alpha_blend(image, alpha_map_small_, pos, logo_value_);
+        spdlog::info("Custom region matches 48x48, using legacy-profile small alpha");
+        remove_watermark_alpha_blend(image, get_alpha_map(WatermarkSize::Small, WatermarkVariant::V1),
+                                     pos, logo_value_);
         return;
     }
-
     if (region.width == 96 && region.height == 96) {
-        spdlog::info("Custom region matches 96x96, using large alpha map");
-        cv::Point pos(region.x, region.y);
-        remove_watermark_alpha_blend(image, alpha_map_large_, pos, logo_value_);
+        spdlog::info("Custom region matches 96x96, using large alpha map (profile {})",
+                     variant == WatermarkVariant::V1 ? "V1" : "V2");
+        remove_watermark_alpha_blend(image, get_alpha_map(WatermarkSize::Large, variant),
+                                     pos, logo_value_);
         return;
     }
 
-    // Create interpolated alpha map for custom size
-    cv::Mat custom_alpha = create_interpolated_alpha(region.width, region.height);
-    cv::Point pos(region.x, region.y);
+    // Arbitrary size: resize the active profile's large alpha map.
+    cv::Mat custom_alpha = create_interpolated_alpha(region.width, region.height, variant);
 
-    spdlog::info("Removing watermark at ({},{}) with custom {}x{} alpha map",
-                 pos.x, pos.y, region.width, region.height);
+    spdlog::info("Removing watermark at ({},{}) with custom {}x{} alpha map (profile {})",
+                 pos.x, pos.y, region.width, region.height,
+                 variant == WatermarkVariant::V1 ? "V1" : "V2");
 
     remove_watermark_alpha_blend(image, custom_alpha, pos, logo_value_);
 }
@@ -460,8 +621,10 @@ void WatermarkEngine::add_watermark_custom(
         return;
     }
 
-    // Create interpolated alpha map for custom size
-    cv::Mat custom_alpha = create_interpolated_alpha(region.width, region.height);
+    // Create interpolated alpha map for custom size (add path uses the
+    // legacy profile -- new watermarks are added with the original alpha)
+    cv::Mat custom_alpha = create_interpolated_alpha(region.width, region.height,
+                                                     WatermarkVariant::V1);
     cv::Point pos(region.x, region.y);
 
     spdlog::info("Adding watermark at ({},{}) with custom {}x{} alpha map",
@@ -954,7 +1117,8 @@ ProcessResult process_image(
     WatermarkEngine& engine,
     std::optional<WatermarkSize> force_size,
     bool use_detection,
-    float detection_threshold) {
+    float detection_threshold,
+    std::optional<WatermarkVariant> force_variant) {
 
     ProcessResult result{};
     result.success = false;
@@ -974,12 +1138,17 @@ ProcessResult process_image(
                      input_path.filename(),
                      image.cols, image.rows);
 
-        // Watermark detection (only for removal mode)
+        // Watermark detection (only for removal mode). The confidence
+        // threshold is the safety gate: below it we skip, so that users
+        // who accidentally drop a non-watermarked file into batch/simple
+        // mode do not have their image silently altered.
         if (use_detection && remove) {
-            DetectionResult detection = engine.detect_watermark(image, force_size);
+            DetectionResult detection = engine.detect_watermark(image, force_size, force_variant);
             result.confidence = detection.confidence;
 
-            if (!detection.detected && detection.confidence < detection_threshold) {
+            const bool ncc_passes = detection.detected ||
+                                    detection.confidence >= detection_threshold;
+            if (!ncc_passes) {
                 result.skipped = true;
                 result.success = true;  // Not an error, just skipped
                 result.message = fmt::format("No watermark detected ({:.0f}%), skipped",
@@ -997,7 +1166,7 @@ ProcessResult process_image(
 
         // Process image
         if (remove) {
-            engine.remove_watermark(image, force_size);
+            engine.remove_watermark(image, force_size, force_variant);
         } else {
             engine.add_watermark(image, force_size);
         }
@@ -1021,8 +1190,12 @@ ProcessResult process_image(
             params = {cv::IMWRITE_WEBP_QUALITY, 101};
         }
 
-        // Write output
-        bool write_success = cv::imwrite(output_path.string(), image, params);
+        // Write output. PNG goes through write_png() so non-ASCII paths
+        // work on older Windows where cv::imwrite()'s path argument is
+        // routed through the system ACP.
+        bool write_success = (ext == ".png")
+            ? write_png(output_path, image, 6)
+            : cv::imwrite(output_path.string(), image, params);
         if (!write_success) {
             result.message = "Failed to write image";
             spdlog::error("Failed to write image: {}", output_path);
