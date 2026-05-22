@@ -253,6 +253,11 @@ struct BatchResult {
 /**
  * Process a single file using the basic pipeline (backward-compatible).
  * No region/snap/denoise support — identical to original behavior.
+ *
+ * When try_legacy_fallback is true and the current-profile attempt
+ * skips, retry with the legacy profile. This is the v0.4.0 default
+ * for the no-flag CLI invocation -- handles mixed Gemini-3.5+ and
+ * pre-3.5 inputs without the user having to script the retry.
  */
 void process_single(
     const fs::path& input,
@@ -263,11 +268,25 @@ void process_single(
     std::optional<WatermarkVariant> force_variant,
     bool use_detection,
     float detection_threshold,
+    bool try_legacy_fallback,
     BatchResult& result
 ) {
     auto proc_result = process_image(input, output, remove, engine,
                                      force_size, use_detection, detection_threshold,
                                      force_variant);
+
+    // Auto-fallback: if we started on V2 and it skipped, give V1 a turn.
+    // No-op when force_variant is already V1 (--legacy) or when the
+    // caller asked us not to fall back (--no-legacy, or batch nested
+    // retry that already happened).
+    if (try_legacy_fallback && proc_result.skipped && remove &&
+        force_variant.value_or(WatermarkVariant::V2) == WatermarkVariant::V2) {
+        spdlog::info("Current profile detected nothing on {} -- retrying with legacy profile",
+                     gwt::filename_utf8(input));
+        proc_result = process_image(input, output, remove, engine,
+                                    force_size, use_detection, detection_threshold,
+                                    WatermarkVariant::V1);
+    }
 
     if (proc_result.skipped) {
         result.skipped++;
@@ -322,8 +341,14 @@ void process_single_advanced(
 #ifdef GWT_HAS_AI_DENOISE
     NcnnDenoiser* denoiser,
 #endif
+    bool try_legacy_fallback,
     BatchResult& result
 ) {
+    // Snapshot counters so we can detect whether *this* call resulted in
+    // a skip (vs. a real failure or a success) and trigger the V1 retry.
+    const int prev_skipped = result.skipped;
+    const int prev_failed  = result.failed;
+    const int prev_success = result.success;
     try {
         // Read image
         cv::Mat image = cv::imread(input.string(), cv::IMREAD_COLOR);
@@ -570,6 +595,31 @@ void process_single_advanced(
         fmt::print(fmt::fg(fmt::color::red), "[FAIL] ");
         fmt::print("{}: {}\n", gwt::filename_utf8(input), e.what());
     }
+
+    // Auto-fallback: if this attempt was a skip (no real failure, no
+    // success) and we were on the current profile, retry once with the
+    // legacy profile. The recursive call passes try_legacy_fallback=false
+    // to bound the retry to a single level.
+    const bool this_skipped = (result.skipped > prev_skipped);
+    const bool this_failed  = (result.failed > prev_failed);
+    const bool this_success = (result.success > prev_success);
+    if (try_legacy_fallback && this_skipped && !this_failed && !this_success &&
+        force_variant.value_or(WatermarkVariant::V2) == WatermarkVariant::V2) {
+        result.skipped = prev_skipped;  // undo the V2 skip; the retry will set the final outcome
+        spdlog::info("Current profile detected nothing on {} -- retrying with legacy profile",
+                     gwt::filename_utf8(input));
+        process_single_advanced(input, output, engine, force_size,
+                                WatermarkVariant::V1,
+                                use_detection, detection_threshold, force_process,
+                                region_str, fallback_region_str,
+                                use_snap, snap_min_size, snap_max_size, snap_threshold,
+                                denoise_cfg,
+#ifdef GWT_HAS_AI_DENOISE
+                                denoiser,
+#endif
+                                /*try_legacy_fallback=*/false,
+                                result);
+    }
 }
 
 /**
@@ -624,8 +674,11 @@ bool is_simple_mode(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (!arg.empty() && arg[0] == '-') {
-            // Allow --banner and --no-banner in simple mode
-            if (arg == "--banner" || arg == "--no-banner") {
+            // Flags compatible with the drag-and-drop / simple-mode path.
+            // Anything else (region, snap, denoise, threshold, ...) routes
+            // through the full CLI11 parser.
+            if (arg == "--banner" || arg == "--no-banner" ||
+                arg == "--legacy" || arg == "--no-legacy") {
                 continue;
             }
             return false;
@@ -651,9 +704,42 @@ int run_simple_mode(int argc, char** argv) {
     constexpr bool use_detection = true;
     constexpr float detection_threshold = 0.25f;
 
+    // Resolve the watermark profile from argv. Same semantics as the
+    // standard-mode flags: --legacy pins V1 only, --no-legacy disables
+    // the auto V2 -> V1 fallback, no flag means try V2 then V1 on skip.
+    bool legacy_flag = false;
+    bool no_legacy_flag = false;
+    int positional_count = 0;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--legacy") legacy_flag = true;
+        else if (arg == "--no-legacy") no_legacy_flag = true;
+        else if (arg == "--banner" || arg == "--no-banner") { /* skip */ }
+        else if (!arg.empty() && arg[0] != '-') positional_count++;
+    }
+    if (legacy_flag && no_legacy_flag) {
+        fmt::print(fmt::fg(fmt::color::red),
+                   "[FATAL] Cannot specify both --legacy and --no-legacy\n");
+        return 2;
+    }
+    std::optional<WatermarkVariant> force_variant;
+    bool try_legacy_fallback = false;
+    const char* profile_label = "";
+    if (legacy_flag) {
+        force_variant = WatermarkVariant::V1;
+        profile_label = ", profile: Legacy";
+    } else if (no_legacy_flag) {
+        force_variant = WatermarkVariant::V2;
+        profile_label = ", profile: Current (no fallback)";
+    } else {
+        force_variant = WatermarkVariant::V2;
+        try_legacy_fallback = true;
+        profile_label = ", profile: Current + Legacy fallback";
+    }
+
     fmt::print(fmt::fg(fmt::color::gray),
-               "Auto-detection enabled (threshold: {:.0f}%)\n\n",
-               detection_threshold * 100.0f);
+               "Auto-detection enabled (threshold: {:.0f}%{})\n\n",
+               detection_threshold * 100.0f, profile_label);
 
     try {
         WatermarkEngine engine(
@@ -666,8 +752,9 @@ int run_simple_mode(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
 
-            // Skip banner flags
-            if (arg == "--banner" || arg == "--no-banner") {
+            // Skip flags already processed above
+            if (arg == "--banner" || arg == "--no-banner" ||
+                arg == "--legacy" || arg == "--no-legacy") {
                 continue;
             }
 
@@ -692,15 +779,22 @@ int run_simple_mode(int argc, char** argv) {
                 continue;
             }
 
-            process_single(input, input, true, engine, std::nullopt, std::nullopt,
-                          use_detection, detection_threshold, result);
+            process_single(input, input, true, engine, std::nullopt, force_variant,
+                          use_detection, detection_threshold, try_legacy_fallback, result);
         }
 
         result.print();
-        return (result.failed > 0) ? 1 : 0;
+        // Exit codes match the standard-mode contract:
+        //   0 = processed (or multi-file run completed without errors)
+        //   1 = single-file invocation where the file was skipped
+        //       (no watermark detected on any tried profile)
+        //   2 = real failure (IO, write error, conflicting flags)
+        if (result.failed > 0) return 2;
+        if (positional_count == 1 && result.success == 0 && result.skipped > 0) return 1;
+        return 0;
     } catch (const std::exception& e) {
         fmt::print(fmt::fg(fmt::color::red), "[FATAL] {}\n", e.what());
-        return 1;
+        return 2;
     }
 }
 
@@ -749,12 +843,17 @@ int run(int argc, char** argv) {
     app.add_flag("--force,-f", force_process,
                  "Force processing without watermark detection (may damage images without watermarks)");
 
-    // Pin watermark profile to legacy. Default behaviour processes images
-    // produced by the current Gemini profile; the legacy profile covers
-    // outputs from versions before Gemini 3.5.
+    // Watermark profile selection. Default tries the current profile first
+    // and falls back to the legacy profile when the current one detects
+    // nothing -- this handles mixed Gemini-3.5+ and pre-3.5 inputs without
+    // user supervision. --legacy pins to legacy only (no current attempt).
+    // --no-legacy disables the legacy fallback (current only).
     bool legacy_variant = false;
+    bool no_legacy = false;
     app.add_flag("--legacy", legacy_variant,
-                 "Pin watermark profile to legacy (pre-Gemini 3.5 outputs)");
+                 "Pin watermark profile to legacy (pre-Gemini 3.5 outputs); skips current-profile attempt");
+    app.add_flag("--no-legacy", no_legacy,
+                 "Disable the automatic legacy-profile fallback; use current profile only");
 
     // Detection threshold
     float detection_threshold = 0.25f;
@@ -831,7 +930,7 @@ int run(int argc, char** argv) {
         fmt::print(fmt::fg(fmt::color::red), "[ERROR] ");
         fmt::print("--snap-min-size ({}) must be <= --snap-max-size ({})\n",
                    snap_min_size, snap_max_size);
-        return 1;
+        return 2;
     }
 
 
@@ -862,7 +961,7 @@ int run(int argc, char** argv) {
     std::optional<WatermarkSize> force_size;
     if (force_small && force_large) {
         spdlog::error("Cannot specify both --force-small and --force-large");
-        return 1;
+        return 2;
     } else if (force_small) {
         force_size = WatermarkSize::Small;
         spdlog::info("Forcing 48x48 watermark size");
@@ -871,10 +970,22 @@ int run(int argc, char** argv) {
         spdlog::info("Forcing 96x96 watermark size");
     }
 
+    if (legacy_variant && no_legacy) {
+        spdlog::error("Cannot specify both --legacy and --no-legacy");
+        return 2;
+    }
     std::optional<WatermarkVariant> force_variant;
+    bool try_legacy_fallback = false;
     if (legacy_variant) {
         force_variant = WatermarkVariant::V1;
         spdlog::info("Pinned to legacy watermark profile (--legacy)");
+    } else if (no_legacy) {
+        force_variant = WatermarkVariant::V2;
+        spdlog::info("Pinned to current watermark profile (--no-legacy)");
+    } else {
+        // Default: try current (V2); fall back to legacy (V1) on skip.
+        force_variant = WatermarkVariant::V2;
+        try_legacy_fallback = true;
     }
 
     // Build denoise config
@@ -958,7 +1069,7 @@ int run(int argc, char** argv) {
             fmt::print(fmt::fg(fmt::color::gray),
                        "  (Note: full Unicode path support requires Windows 10 version 1903 or later)\n");
 #endif
-            return 1;
+            return 2;
         }
 
         BatchResult result;
@@ -992,11 +1103,11 @@ int run(int argc, char** argv) {
 #ifdef GWT_HAS_AI_DENOISE
                         denoiser.get(),
 #endif
-                        result);
+                        try_legacy_fallback, result);
                 } else {
                     process_single(entry.path(), out_file, remove_mode, engine,
                                   force_size, force_variant, use_detection,
-                                  detection_threshold, result);
+                                  detection_threshold, try_legacy_fallback, result);
                 }
             }
 
@@ -1011,18 +1122,29 @@ int run(int argc, char** argv) {
 #ifdef GWT_HAS_AI_DENOISE
                     denoiser.get(),
 #endif
-                    result);
+                    try_legacy_fallback, result);
             } else {
                 process_single(input, output, remove_mode, engine,
                               force_size, force_variant, use_detection,
-                              detection_threshold, result);
+                              detection_threshold, try_legacy_fallback, result);
             }
         }
 
-        return (result.failed > 0) ? 1 : 0;
+        // Exit codes:
+        //   0 = processed (or batch completed without errors)
+        //   1 = single-file run where the file was skipped (no watermark
+        //       found on any tried profile) -- lets scripts chain with
+        //       `if %ERRORLEVEL% neq 0 ...` to try --force or a different
+        //       region. Batch runs keep 0 on mixed skip/processed so
+        //       directory scans behave as expected.
+        //   2 = real failure (IO, write error, conflicting flags)
+        const bool batch_input = fs::is_directory(input);
+        if (result.failed > 0) return 2;
+        if (!batch_input && result.success == 0 && result.skipped > 0) return 1;
+        return 0;
     } catch (const std::exception& e) {
         spdlog::error("Fatal error: {}", e.what());
-        return 1;
+        return 2;
     }
 }
 

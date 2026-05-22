@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/allenk/GeminiWatermarkTool?style=social)](https://github.com/allenk/GeminiWatermarkTool)
 
-🆕 **Gemini 3.5 watermark profile supported** — Google updated the watermark layout (different position and alpha map) starting with Gemini 3.5. This tool now auto-targets the new profile by default, with a one-click **Legacy** toggle for pre-3.5 outputs. [Details below](#-gemini-35-support--new).
+🆕 **Gemini 3.5 watermark profile supported, with automatic legacy fallback** (v0.4.0) — the CLI tries the current Gemini 3.5+ profile first; if detection skips, it automatically retries with the legacy (pre-3.5) profile. Disable with `--no-legacy`, or pin legacy directly with `--legacy`. [Details below](#-gemini-35-support--new).
 
 📢 **Now available: [Veo Video Watermark Remover](https://github.com/allenk/VeoWatermarkRemover)** — remove Google Veo "Veo" text watermarks from videos, same reverse alpha blending engine. Demo build (Win x64).
 
@@ -66,6 +66,51 @@ Key capabilities include:
 | **CLI** | default | pass `--legacy` |
 
 Both profiles use the same deterministic reverse alpha blending pipeline — switching profiles only changes the alpha map and position formula, not the math.
+
+### Automatic Legacy Fallback (v0.4.0, CLI only)
+
+The CLI default now handles mixed Gemini-3.5+ and pre-3.5 inputs without
+the user having to script the retry. When the current-profile detector
+returns *skipped* (confidence below threshold), the CLI automatically
+runs the same image through the legacy profile before reporting the
+final outcome. Behaviour matrix:
+
+| Invocation | First attempt | Fallback | Notes |
+|---|---|---|---|
+| `GeminiWatermarkTool image.png` | V2 (current) | V1 if V2 skips | new v0.4.0 default |
+| `GeminiWatermarkTool --legacy image.png` | V1 only | — | pin legacy, no fallback |
+| `GeminiWatermarkTool --no-legacy image.png` | V2 only | — | matches v0.3.0 default |
+| `GeminiWatermarkTool --legacy --no-legacy …` | — | — | conflict, exits 2 |
+
+The safety contract is unchanged: each profile attempt is still gated
+by the confidence threshold, so non-Gemini images skip on both V2 and
+V1 and remain untouched. The GUI is unchanged — its Legacy checkbox is
+explicit, no automatic fallback.
+
+### Exit Codes (v0.4.0)
+
+The CLI now returns distinct exit codes so scripts can chain retries
+without inspecting stdout or checking for an output file:
+
+| Code | Meaning |
+|---|---|
+| **0** | File processed (or batch directory completed with no errors) |
+| **1** | Single-file invocation skipped — no watermark detected on any tried profile |
+| **2** | Real failure — bad arguments, missing input, IO/write error |
+
+Batch directory mode (`-i somedir -o somedir`) keeps lenient semantics:
+exit 0 unless something actually fails, since partial skips are normal
+when scanning a folder.
+
+Example Windows shell chain:
+
+```bat
+GeminiWatermarkTool.exe -i image.png -o clean.png
+if %ERRORLEVEL% equ 1 (
+    rem auto-fallback tried both V2 and V1 and skipped; user may want --force
+    GeminiWatermarkTool.exe -i image.png -o clean.png --force
+)
+```
 
 ## 🎬 Veo Video Watermark Removal — Demo Available
 
