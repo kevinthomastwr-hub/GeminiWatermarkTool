@@ -6,10 +6,11 @@
 [![MCP](https://img.shields.io/badge/MCP-Server%20Available-blue.svg)](https://github.com/allenk/gwt-integrations)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/allenk/GeminiWatermarkTool?style=social)](https://github.com/allenk/GeminiWatermarkTool)
+[![Support on Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/allenkoss)
 
 🆕 **Gemini 3.5 watermark profile supported, with automatic legacy fallback** (v0.3.1) — the CLI tries the current Gemini 3.5+ profile first; if detection skips, it automatically retries with the legacy (pre-3.5) profile. Disable with `--no-legacy`, or pin legacy directly with `--legacy`. [Details below](#-gemini-35-support--new).
 
-📢 **Now available: [Veo Video Watermark Remover](https://github.com/allenk/VeoWatermarkRemover)** — remove Google Veo "Veo" text watermarks from videos, same reverse alpha blending engine. Demo build (Win x64).
+🎬 **[Veo Video Watermark Remover v0.6.1](https://github.com/allenk/VeoWatermarkRemover/releases/latest) is out — full Gemini 3.5 video watermark removal across Windows / Linux / macOS.** Auto-detect for 1080p + 720p (standard and compact diamond variants), **adaptive per-frame alpha** via bisection feedback, **tick-exact transcoder timing**, audio passthrough + AI denoise. Drag-and-drop simple, no cloud, no AI hallucination — just the same reverse alpha blending math, evolved for video. [Details below](#-veo-video-watermark-removal--v061-released).
 
 ▶️ **Watch: [GeminiWatermarkTool — Quick Start & Feature Overview](https://www.youtube.com/watch?v=0jux3AJVb2Q)**
 
@@ -112,22 +113,50 @@ if %ERRORLEVEL% equ 1 (
 )
 ```
 
-## 🎬 Veo Video Watermark Removal — Demo Available
+## 🎬 Veo Video Watermark Removal — v0.6.1 Released
 
-> **NEW:** GeminiWatermarkTool now supports removing **Google Veo** video watermarks.
-> The same reverse alpha blending engine, now for video — direct mp4-to-mp4, with audio preserved.
+> **GeminiWatermarkTool now supports removing Google Veo and Gemini 3.5 video watermarks across Windows, Linux, and macOS.**
+> The same reverse alpha blending engine, evolved for video — direct mp4-to-mp4, with audio preserved, mathematically deterministic.
 
-A standalone demo build (Windows x64) is available for testing:
+**[VeoWatermarkRemover v0.6.1-demo — Download →](https://github.com/allenk/VeoWatermarkRemover/releases/latest)**
 
-**[VeoWatermarkRemover — Download Demo](https://github.com/allenk/VeoWatermarkRemover)**
+### What's supported
 
-- Drag & drop your Veo `.mp4` file onto the exe — done
-- 36 MB standalone, zero dependencies
-- 720p ~50 fps, 1080p ~18 fps
-- AI denoise + audio passthrough included
+- **Gemini 3.5 diamond watermark** (default, no flag needed) — auto-detected per file:
+  - **1080p**: 1920×1080 landscape, 1080×1920 portrait (validated end-to-end)
+  - **720p**: 1280×720 landscape, 720×1280 portrait — both **standard** (48×48) and **compact** (44×44) diamond variants
+- **Legacy "Veo" text watermark** (`--legacy`) — pre-Gemini-3.5 outputs still supported
+- **Audio passthrough** — original audio kept without re-encoding
+- **AI denoise** — GPU-accelerated FDnCNN cleanup (Vulkan, automatic CPU fallback)
+- **Cross-platform binaries** — Windows x64, Linux x64, macOS Universal (Intel + Apple Silicon)
 
-> Cross-platform support and GUI integration are coming soon.
-> This Veo feature will be merged into GeminiWatermarkTool when stable.
+### v0.6.1 algorithm highlights
+
+- **Multi-frame detection probe** — auto-detect probes 12 frames spread across the video, so intro fade-ins / splash screens no longer cause false SKIPs.
+- **Adaptive per-frame alpha via bisection feedback** — applies a candidate intensity, evaluates whether the result matches the surrounding background, and adjusts up (residue) or down (over-subtraction) for up to 5 rounds per frame. Visual-consistency goal rather than predictive accuracy, so neighbouring frames that look similar also remove similarly.
+- **Per-shot seed + per-frame change cap** — a stable per-video baseline anchors the bisection, and a ±0.05 per-frame movement cap prevents single-frame metric noise from causing visible flashes on content with heavy foreground motion.
+- **Tick-exact transcoder timing** — output frame count, duration, and FPS metadata match input exactly. No drift in NLE / editor alignment (fix for previous releases that silently dropped 1-3 tail frames).
+- **`--variant 720p-1` / `--variant 720p-2` escape hatch** when auto-detect can't lock on (very rare with the multi-frame probe).
+- **`--sigma` tuning** — `--sigma 15` for anime / illustration content, `--sigma 25` when default AI denoise feels too aggressive.
+
+### Drag-and-drop simple
+
+```bash
+# Default — Gemini 3.5 diamond removal (1080p + 720p auto-detected)
+GeminiWatermarkTool-Video video.mp4
+
+# Pre-Gemini-3.5 video with "Veo" text watermark
+GeminiWatermarkTool-Video --legacy old_veo_video.mp4
+
+# Anime / illustration content (lighter AI denoise)
+GeminiWatermarkTool-Video --sigma 15 video.mp4
+```
+
+### Honest caveat
+
+Some content with very strong per-frame motion or foreground objects overlapping the watermark region can still leave a small residue on a few frames. For those, the [manual touch-up workflow](https://github.com/allenk/VeoWatermarkRemover#manual-touch-up-workflow-for-difficult-clips) (ffmpeg decompose → GUI hand-fix the problem frames → ffmpeg recompose) covers the gap; most clips need only a handful of touch-ups.
+
+> The Veo feature is currently distributed via the standalone [VeoWatermarkRemover](https://github.com/allenk/VeoWatermarkRemover) demo repo. When the pipeline is fully stable across all observed content classes, it will be merged into GeminiWatermarkTool as a unified release supporting both image and video watermark removal.
 
 ## 🖥️ GUI Application — Major Update
 
@@ -868,6 +897,12 @@ The removal of watermarks may have legal implications depending on your jurisdic
 The author does not condone or encourage the misuse of this tool for copyright infringement, misrepresentation, or any other unlawful purposes.
 
 **THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.**
+
+## ❤️ Support This Project
+
+If GeminiWatermarkTool saved you time and you'd like to help keep it going, you can [support on Ko-fi](https://ko-fi.com/allenkoss). Every public release goes through GitHub Actions CI on Windows / Linux / macOS / Android, and the binaries live in the Releases section — small contributions help cover runner minutes and storage so the project can keep building cross-platform binaries for free. Not required, just appreciated.
+
+Bug reports, sample images / videos, and pull requests remain the most valuable contributions and always will be — opening an [issue](https://github.com/allenk/GeminiWatermarkTool/issues) with content the tool can't handle is often more useful than a one-off donation.
 
 ## License
 
